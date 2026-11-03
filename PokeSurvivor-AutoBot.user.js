@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PokeSurvivor AutoBot
 // @namespace    https://github.com/
-// @version      0.2.0
-// @description  PokeSurvivor AutoBot - Safari single file
+// @version      0.3.0
+// @description  PokeSurvivor AutoBot - capture game handle
 // @match        https://pokesurvivor.doofcraft.com/*
 // @run-at       document-start
 // @grant        none
@@ -11,22 +11,12 @@
 (function () {
     "use strict";
 
-    // =========================================================
-    // CONFIG
-    // =========================================================
-
     const CONFIG = {
         enabled: true,
         debug: true,
         panel: true,
-
-        discoveryInterval: 500,
         statusInterval: 500
     };
-
-    // =========================================================
-    // STATE
-    // =========================================================
 
     const STATE = {
         running: false,
@@ -39,22 +29,21 @@
         gameHandle: null,
         playerId: null,
 
+        createCalls: 0,
+        lastCreateArgs: null,
+        lastCreateResult: null,
+
         level: 0,
         hp: 0,
         maxHp: 0,
         xp: 0,
         xpNext: 0,
-
         x: 0,
         y: 0,
 
         lastError: null,
         lastUpdate: 0
     };
-
-    // =========================================================
-    // DEBUG
-    // =========================================================
 
     function log(...args) {
         if (CONFIG.debug) {
@@ -64,19 +53,10 @@
 
     function error(err) {
         STATE.lastError =
-            err instanceof Error
-                ? err.message
-                : String(err);
+            err instanceof Error ? err.message : String(err);
 
         console.error("[PSBot]", err);
     }
-
-    // =========================================================
-    // WASM HOOK
-    // =========================================================
-
-    let originalInstantiate = null;
-    let originalInstantiateStreaming = null;
 
     function isGameWasm(exports) {
         if (!exports) return false;
@@ -100,11 +80,87 @@
         return score >= 2;
     }
 
+    let originalInstantiate = null;
+    let originalInstantiateStreaming = null;
+
+    function hookGameCreate(exports) {
+        if (!exports) return;
+
+        const original = exports.game_create;
+
+        if (typeof original !== "function") {
+            log("game_create not available");
+            return;
+        }
+
+        if (original.__PSBOT_WRAPPED__) {
+            return;
+        }
+
+        try {
+            const wrapped = function (a, b, c, d) {
+                STATE.createCalls++;
+
+                STATE.lastCreateArgs = [a, b, c, d];
+
+                log(
+                    "game_create called:",
+                    "a =", a,
+                    "b =", b,
+                    "c =", c,
+                    "d =", d
+                );
+
+                let result;
+
+                try {
+                    result = original(a, b, c, d);
+                } catch (e) {
+                    error(e);
+                    throw e;
+                }
+
+                STATE.lastCreateResult = result;
+
+                log("game_create result:", result);
+
+                if (
+                    typeof result === "number" &&
+                    Number.isFinite(result) &&
+                    result !== 0
+                ) {
+                    STATE.gameHandle = result;
+
+                    log(
+                        "Possible gameHandle captured:",
+                        STATE.gameHandle
+                    );
+                }
+
+                return result;
+            };
+
+            Object.defineProperty(wrapped, "__PSBOT_WRAPPED__", {
+                value: true
+            });
+
+            exports.game_create = wrapped;
+
+            log("game_create hook installed.");
+
+        } catch (e) {
+            error(e);
+            log(
+                "Could not replace game_create export.",
+                e
+            );
+        }
+    }
+
     function registerWasm(instance) {
         if (!instance) return false;
 
-        const exports =
-            instance.exports || instance;
+        const exports = instance.exports || instance;
 
         if (!exports) return false;
 
@@ -127,11 +183,12 @@
             gameExports
         );
 
+        hookGameCreate(exports);
+
         return true;
     }
 
     function inspectInstantiateResult(result) {
-
         if (!result) {
             return result;
         }
@@ -143,14 +200,11 @@
             return result.then(value => {
 
                 try {
-
                     if (value?.instance) {
                         registerWasm(value.instance);
-                    }
-                    else if (value?.exports) {
+                    } else if (value?.exports) {
                         registerWasm(value);
                     }
-
                 } catch (e) {
                     error(e);
                 }
@@ -160,14 +214,11 @@
         }
 
         try {
-
             if (result.instance) {
                 registerWasm(result.instance);
-            }
-            else if (result.exports) {
+            } else if (result.exports) {
                 registerWasm(result);
             }
-
         } catch (e) {
             error(e);
         }
@@ -177,16 +228,10 @@
 
     function installWasmHooks() {
 
-        if (
-            typeof WebAssembly === "undefined"
-        ) {
+        if (typeof WebAssembly === "undefined") {
             error("WebAssembly unavailable.");
             return;
         }
-
-        // -----------------------------------------------------
-        // instantiate
-        // -----------------------------------------------------
 
         if (
             typeof WebAssembly.instantiate === "function" &&
@@ -233,12 +278,9 @@
             }
         }
 
-        // -----------------------------------------------------
-        // instantiateStreaming
-        // -----------------------------------------------------
-
         if (
-            typeof WebAssembly.instantiateStreaming === "function" &&
+            typeof WebAssembly.instantiateStreaming ===
+                "function" &&
             !WebAssembly.__PSBOT_STREAMING_HOOKED__
         ) {
 
@@ -283,14 +325,6 @@
         }
     }
 
-    // =========================================================
-    // WASM HELPERS
-    // =========================================================
-
-    function getWasm() {
-        return STATE.wasmExports;
-    }
-
     function wasmReady() {
         return (
             STATE.wasmDetected &&
@@ -298,57 +332,14 @@
         );
     }
 
-    function wasmFunction(name) {
-
-        const wasm = getWasm();
-
-        if (!wasm) {
-            return null;
-        }
-
-        if (
-            typeof wasm[name] !== "function"
-        ) {
-            return null;
-        }
-
-        return wasm[name];
-    }
-
-    // =========================================================
-    // GAME DISCOVERY
-    // =========================================================
-
-    function discoverGame() {
-
-        if (!wasmReady()) {
-            return false;
-        }
-
-        /*
-         * We intentionally do NOT guess gameHandle/playerId.
-         *
-         * The game object may live inside module closures,
-         * therefore blindly scanning window is unreliable.
-         */
-
-        return false;
-    }
-
-    // =========================================================
-    // SAFE WASM INSPECTION
-    // =========================================================
-
     function inspectWasm() {
 
         if (!wasmReady()) {
             return null;
         }
 
-        const wasm = getWasm();
-
         const exports =
-            Object.keys(wasm);
+            Object.keys(STATE.wasmExports);
 
         const gameExports =
             exports.filter(
@@ -362,17 +353,13 @@
         };
     }
 
-    // =========================================================
-    // DEBUG PANEL
-    // =========================================================
-
     let panel = null;
 
     function createPanel() {
 
-        if (!CONFIG.panel) return;
-
-        if (panel) return;
+        if (!CONFIG.panel || panel) {
+            return;
+        }
 
         panel =
             document.createElement("div");
@@ -385,14 +372,14 @@
             top: 10px;
             right: 10px;
             z-index: 2147483647;
-            background: rgba(0,0,0,.85);
+            background: rgba(0,0,0,.88);
             color: #fff;
             padding: 10px;
             border-radius: 8px;
             font: 12px monospace;
             line-height: 1.5;
-            min-width: 240px;
-            max-width: 360px;
+            min-width: 260px;
+            max-width: 380px;
             pointer-events: none;
             white-space: pre-wrap;
         `;
@@ -400,35 +387,39 @@
         panel.textContent =
             "PokeSurvivor AutoBot\nStarting...";
 
-        document.documentElement.appendChild(
-            panel
-        );
+        if (document.documentElement) {
+            document.documentElement.appendChild(
+                panel
+            );
+        }
     }
 
     function updatePanel() {
 
-        if (!panel) return;
-
-        const info =
-            inspectWasm();
+        if (!panel) {
+            return;
+        }
 
         panel.textContent =
 `PokeSurvivor AutoBot
 
-Bot: ${STATE.running ? "ON" : "OFF"}
-Paused: ${STATE.paused ? "YES" : "NO"}
+Bot:
+${STATE.running ? "ON" : "OFF"}
 
-WASM: ${
-    STATE.wasmDetected
-        ? "DETECTED"
-        : "WAITING"
-}
+WASM:
+${STATE.wasmDetected ? "DETECTED" : "WAITING"}
+
+game_create calls:
+${STATE.createCalls}
 
 Game Handle:
 ${STATE.gameHandle ?? "not found"}
 
 Player:
 ${STATE.playerId ?? "not found"}
+
+Last create:
+${STATE.lastCreateResult ?? "none"}
 
 Level:
 ${STATE.level}
@@ -442,56 +433,36 @@ ${STATE.xp}/${STATE.xpNext}
 Position:
 ${STATE.x.toFixed(2)}, ${STATE.y.toFixed(2)}
 
-${
-    STATE.lastError
-        ? "Error: " + STATE.lastError
-        : ""
-}`;
+${STATE.lastError
+    ? "Error: " + STATE.lastError
+    : ""}`;
     }
 
-    // =========================================================
-    // BOT
-    // =========================================================
-
     function startBot() {
-
         STATE.running = true;
         STATE.paused = false;
-
         log("Bot started.");
     }
 
     function stopBot() {
-
         STATE.running = false;
         STATE.paused = true;
-
         log("Bot stopped.");
     }
 
     function pauseBot() {
-
         STATE.paused = true;
-
         log("Bot paused.");
     }
 
     function resumeBot() {
-
         if (!STATE.running) {
             return;
         }
 
         STATE.paused = false;
-
         log("Bot resumed.");
     }
-
-    // =========================================================
-    // MAIN LOOP
-    // =========================================================
-
-    let statusTimer = null;
 
     function mainLoop() {
 
@@ -503,39 +474,23 @@ ${
             return;
         }
 
-        try {
-
-            discoverGame();
-
-            STATE.lastUpdate =
-                performance.now();
-
-        } catch (e) {
-            error(e);
-        }
+        STATE.lastUpdate =
+            performance.now();
     }
 
     function startLoop() {
 
-        if (statusTimer) {
-            return;
-        }
+        setInterval(() => {
 
-        statusTimer =
-            setInterval(
-                () => {
+            try {
+                mainLoop();
+                updatePanel();
+            } catch (e) {
+                error(e);
+            }
 
-                    mainLoop();
-                    updatePanel();
-
-                },
-                CONFIG.statusInterval
-            );
+        }, CONFIG.statusInterval);
     }
-
-    // =========================================================
-    // PUBLIC API
-    // =========================================================
 
     window.PokeSurvivorBot = {
 
@@ -569,47 +524,37 @@ ${
         status() {
 
             return {
-
                 running: STATE.running,
                 paused: STATE.paused,
 
                 wasm: STATE.wasmDetected,
 
-                gameHandle:
-                    STATE.gameHandle,
+                gameHandle: STATE.gameHandle,
+                playerId: STATE.playerId,
 
-                playerId:
-                    STATE.playerId,
+                createCalls: STATE.createCalls,
+                lastCreateArgs:
+                    STATE.lastCreateArgs,
+                lastCreateResult:
+                    STATE.lastCreateResult,
 
-                level:
-                    STATE.level,
+                level: STATE.level,
 
-                hp:
-                    STATE.hp,
+                hp: STATE.hp,
+                maxHp: STATE.maxHp,
 
-                maxHp:
-                    STATE.maxHp,
-
-                xp:
-                    STATE.xp,
-
-                xpNext:
-                    STATE.xpNext,
+                xp: STATE.xp,
+                xpNext: STATE.xpNext,
 
                 position: {
                     x: STATE.x,
                     y: STATE.y
                 },
 
-                error:
-                    STATE.lastError
+                error: STATE.lastError
             };
         }
     };
-
-    // =========================================================
-    // INITIALIZE
-    // =========================================================
 
     function initialize() {
 
@@ -623,16 +568,13 @@ ${
             Boolean(CONFIG.enabled);
 
         createPanel();
+
         startLoop();
 
         log(
             "PokeSurvivor AutoBot initialized."
         );
     }
-
-    // =========================================================
-    // START
-    // =========================================================
 
     initialize();
 
