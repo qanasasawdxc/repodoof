@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokeSurvivor AutoBot
 // @namespace    psbot
-// @version      0.6.0
+// @version      0.7.0
 // @match        https://pokesurvivor.doofcraft.com/*
 // @run-at       document-start
 // @grant        none
@@ -14,11 +14,15 @@
         wasm: false,
         instance: null,
         exports: null,
+        originalExports: null,
+
         handle: null,
         createCalls: 0,
+
         inputCalls: [],
         players: [],
         counts: null,
+
         error: null
     };
 
@@ -42,51 +46,80 @@
         }
     };
 
-    const log = (...x) =>
-        console.log("%c[PSBot]", "color:#00e5ff;font-weight:bold", ...x);
+    function log(...args) {
+        console.log(
+            "%c[PSBot]",
+            "color:#00e5ff;font-weight:bold",
+            ...args
+        );
+    }
 
-    const err = (...x) =>
-        console.error("[PSBot]", ...x);
+    function error(...args) {
+        console.error("[PSBot]", ...args);
+    }
 
+    /*
+     * Đọc UTF-8 trực tiếp từ WASM memory.
+     */
     function decodeMemory(ptr, len) {
         try {
-            if (!S.exports?.memory)
+            if (!S.originalExports)
                 return null;
 
-            if (!Number.isInteger(ptr) || !Number.isInteger(len))
+            const memory = S.originalExports.memory;
+
+            if (!memory)
+                return null;
+
+            if (!Number.isInteger(ptr) ||
+                !Number.isInteger(len))
                 return null;
 
             if (ptr < 0 || len < 0)
                 return null;
 
+            if (ptr + len > memory.buffer.byteLength)
+                return null;
+
             const bytes = new Uint8Array(
-                S.exports.memory.buffer,
+                memory.buffer,
                 ptr,
                 len
             );
 
             return new TextDecoder().decode(bytes);
+
         } catch (e) {
             return null;
         }
     }
 
-    function getReturnString(length) {
+    /*
+     * Các hàm game_* trả về độ dài chuỗi.
+     * ret_ptr() cho biết vị trí chuỗi trong WASM memory.
+     */
+    function readReturnedString(length) {
         try {
-            if (!S.exports?.ret_ptr)
+            if (!S.originalExports)
                 return null;
 
-            const ptr = S.exports.ret_ptr();
+            const retPtr = S.originalExports.ret_ptr;
+
+            if (typeof retPtr !== "function")
+                return null;
+
+            const ptr = retPtr();
 
             return decodeMemory(ptr, length);
+
         } catch {
             return null;
         }
     }
 
-    function tryJSON(text) {
+    function parseJSON(text) {
         if (typeof text !== "string")
-            return null;
+            return text;
 
         try {
             return JSON.parse(text);
@@ -95,31 +128,41 @@
         }
     }
 
+    /*
+     * Lấy danh sách player.
+     */
     function inspectPlayers() {
-        if (S.handle == null || !S.exports?.game_player)
+        if (
+            S.handle == null ||
+            !S.originalExports?.game_player
+        ) {
             return;
+        }
 
         const found = [];
 
-        // Thử một số index đầu tiên.
         for (let i = 0; i < 32; i++) {
             try {
-                const len = S.exports.game_player(S.handle, i);
+                const len =
+                    S.originalExports.game_player(
+                        S.handle,
+                        i
+                    );
 
                 if (!len)
                     continue;
 
-                const text = getReturnString(len);
+                const text =
+                    readReturnedString(len);
 
                 if (!text)
                     continue;
 
-                const value = tryJSON(text);
-
                 found.push({
                     index: i,
-                    value
+                    value: parseJSON(text)
                 });
+
             } catch {
                 break;
             }
@@ -128,74 +171,124 @@
         S.players = found;
 
         if (found.length) {
-            log("Players:", found);
+            log("PLAYERS:", found);
         }
     }
 
+    /*
+     * Lấy counts của game.
+     */
     function inspectCounts() {
-        if (S.handle == null || !S.exports?.game_counts)
+        if (
+            S.handle == null ||
+            !S.originalExports?.game_counts
+        ) {
             return;
+        }
 
         try {
-            const len = S.exports.game_counts(S.handle);
-            const text = getReturnString(len);
+            const len =
+                S.originalExports.game_counts(
+                    S.handle
+                );
 
-            if (text) {
-                S.counts = tryJSON(text);
-                log("Counts:", S.counts);
-            }
+            if (!len)
+                return;
+
+            const text =
+                readReturnedString(len);
+
+            if (!text)
+                return;
+
+            S.counts = parseJSON(text);
+
+            log("COUNTS:", S.counts);
+
         } catch (e) {
             S.error = String(e);
         }
     }
 
-    function wrapExports(originalExports) {
-        return new Proxy(originalExports, {
-            get(target, prop, receiver) {
-                const original =
-                    Reflect.get(target, prop, receiver);
+    /*
+     * Tạo một EXPORT OBJECT mới.
+     *
+     * QUAN TRỌNG:
+     * Không Proxy WebAssembly.Exports.
+     */
+    function createWrappedExports(originalExports) {
+        const wrapped = {};
 
-                if (typeof original !== "function")
-                    return original;
+        for (const prop of Reflect.ownKeys(originalExports)) {
 
-                if (prop === "game_create") {
-                    return function (...args) {
-                        const result =
-                            Reflect.apply(original, target, args);
+            const original = originalExports[prop];
 
-                        S.createCalls++;
-                        S.handle = result;
-                        S.wasm = true;
+            if (typeof original !== "function") {
+                wrapped[prop] = original;
+                continue;
+            }
 
-                        log("game_create -> HANDLE =", result);
+            /*
+             * game_create
+             */
+            if (prop === "game_create") {
 
-                        setTimeout(() => {
-                            inspectCounts();
-                            inspectPlayers();
-                        }, 0);
+                wrapped[prop] = function (...args) {
 
-                        return result;
-                    };
-                }
+                    const result =
+                        Reflect.apply(
+                            original,
+                            originalExports,
+                            args
+                        );
 
-                if (prop === "game_set_input") {
-                    return function (...args) {
-                        /*
-                         * Signature:
-                         *
-                         * game_set_input(
-                         *   handle,
-                         *   player_ptr,
-                         *   player_len,
-                         *   moveX,
-                         *   moveY,
-                         *   hasSlot,
-                         *   slot,
-                         *   hasAim,
-                         *   aim,
-                         *   fire
-                         * )
-                         */
+                    S.createCalls++;
+
+                    S.handle = result;
+                    S.wasm = true;
+
+                    log(
+                        "GAME HANDLE:",
+                        result
+                    );
+
+                    /*
+                     * Đợi game JS hoàn thành phần
+                     * khởi tạo rồi mới đọc player.
+                     */
+                    setTimeout(() => {
+                        inspectCounts();
+                        inspectPlayers();
+                    }, 50);
+
+                    return result;
+                };
+
+                continue;
+            }
+
+            /*
+             * game_set_input
+             *
+             * Signature:
+             *
+             * game_set_input(
+             *   handle,
+             *   player_ptr,
+             *   player_len,
+             *   moveX,
+             *   moveY,
+             *   hasSlot,
+             *   slot,
+             *   hasAim,
+             *   aim,
+             *   fire
+             * )
+             */
+            if (prop === "game_set_input") {
+
+                wrapped[prop] =
+                    function (...args) {
 
                         const [
                             handle,
@@ -216,7 +309,7 @@
                                 playerLen
                             );
 
-                        const data = {
+                        const input = {
                             handle,
                             player,
                             moveX,
@@ -229,147 +322,232 @@
                             time: performance.now()
                         };
 
-                        S.inputCalls.push(data);
+                        S.inputCalls.push(input);
 
-                        if (S.inputCalls.length > 100)
+                        if (S.inputCalls.length > 100) {
                             S.inputCalls.shift();
+                        }
 
-                        log("INPUT:", data);
+                        log("INPUT:", input);
 
                         return Reflect.apply(
                             original,
-                            target,
+                            originalExports,
                             args
                         );
                     };
-                }
 
-                if (prop === "game_player") {
-                    return function (...args) {
+                continue;
+            }
+
+            /*
+             * game_player
+             */
+            if (prop === "game_player") {
+
+                wrapped[prop] =
+                    function (...args) {
+
                         const result =
-                            Reflect.apply(original, target, args);
-
-                        const text =
-                            getReturnString(result);
-
-                        if (text) {
-                            log(
-                                "game_player",
-                                args,
-                                tryJSON(text)
+                            Reflect.apply(
+                                original,
+                                originalExports,
+                                args
                             );
-                        }
+
+                        try {
+                            const text =
+                                readReturnedString(
+                                    result
+                                );
+
+                            if (text) {
+                                log(
+                                    "game_player:",
+                                    args,
+                                    parseJSON(text)
+                                );
+                            }
+                        } catch {}
 
                         return result;
                     };
-                }
 
-                if (prop === "game_counts") {
-                    return function (...args) {
+                continue;
+            }
+
+            /*
+             * game_counts
+             */
+            if (prop === "game_counts") {
+
+                wrapped[prop] =
+                    function (...args) {
+
                         const result =
-                            Reflect.apply(original, target, args);
+                            Reflect.apply(
+                                original,
+                                originalExports,
+                                args
+                            );
 
-                        const text =
-                            getReturnString(result);
+                        try {
+                            const text =
+                                readReturnedString(
+                                    result
+                                );
 
-                        if (text) {
-                            const value = tryJSON(text);
-                            S.counts = value;
-                            log("game_counts:", value);
-                        }
+                            if (text) {
+                                S.counts =
+                                    parseJSON(text);
+
+                                log(
+                                    "game_counts:",
+                                    S.counts
+                                );
+                            }
+                        } catch {}
 
                         return result;
                     };
-                }
 
-                return function (...args) {
+                continue;
+            }
+
+            /*
+             * Các export còn lại:
+             * giữ nguyên chức năng.
+             */
+            wrapped[prop] =
+                function (...args) {
                     return Reflect.apply(
                         original,
-                        target,
+                        originalExports,
                         args
                     );
                 };
-            }
-        });
+        }
+
+        return wrapped;
     }
 
-    function installResult(result, type) {
+    /*
+     * Xử lý instance WASM.
+     */
+    function interceptResult(result, source) {
+
         try {
-            if (!result)
+
+            if (!result?.instance?.exports) {
                 return result;
+            }
 
-            const instance = result.instance;
+            const instance =
+                result.instance;
 
-            if (!instance?.exports)
-                return result;
-
-            const originalExports = instance.exports;
-
-            const wrappedExports =
-                wrapExports(originalExports);
-
-            /*
-             * df() trong game chỉ cần instance.exports.
-             * Không Proxy trực tiếp WebAssembly.Instance.
-             */
-            const wrappedInstance = {
-                exports: wrappedExports
-            };
+            const originalExports =
+                instance.exports;
 
             S.instance = instance;
-            S.exports = wrappedExports;
+            S.originalExports =
+                originalExports;
+
+            S.exports =
+                createWrappedExports(
+                    originalExports
+                );
+
             S.wasm = true;
 
-            log("Game WASM detected:", type);
             log(
-                "Exports:",
+                "GAME WASM DETECTED:",
+                source
+            );
+
+            log(
+                "EXPORTS:",
                 Object.keys(originalExports)
             );
 
+            /*
+             * Chỉ trả về object mới.
+             *
+             * Game loader của PokeSurvivor
+             * chỉ cần result.module và
+             * result.instance.exports.
+             */
             return {
                 module: result.module,
-                instance: wrappedInstance
+                instance: {
+                    exports: S.exports
+                }
             };
+
         } catch (e) {
+
             S.error = String(e);
-            err("installResult error:", e);
+
+            error(
+                "WASM interception error:",
+                e
+            );
+
             return result;
         }
     }
 
-    const originalInstantiate =
+    /*
+     * Hook instantiate().
+     */
+    const nativeInstantiate =
         WebAssembly.instantiate;
 
-    WebAssembly.instantiate = async function (...args) {
-        log("WebAssembly.instantiate()");
-
-        const result =
-            await originalInstantiate.apply(this, args);
-
-        return installResult(
-            result,
-            "instantiate"
-        );
-    };
-
-    const originalStreaming =
-        WebAssembly.instantiateStreaming;
-
-    WebAssembly.instantiateStreaming =
+    WebAssembly.instantiate =
         async function (...args) {
-            log("WebAssembly.instantiateStreaming()");
+
+            log(
+                "WebAssembly.instantiate()"
+            );
 
             const result =
-                await originalStreaming.apply(
+                await nativeInstantiate.apply(
                     this,
                     args
                 );
 
-            return installResult(
+            return interceptResult(
+                result,
+                "instantiate"
+            );
+        };
+
+    /*
+     * Hook instantiateStreaming().
+     */
+    const nativeStreaming =
+        WebAssembly.instantiateStreaming;
+
+    WebAssembly.instantiateStreaming =
+        async function (...args) {
+
+            log(
+                "WebAssembly.instantiateStreaming()"
+            );
+
+            const result =
+                await nativeStreaming.apply(
+                    this,
+                    args
+                );
+
+            return interceptResult(
                 result,
                 "streaming"
             );
         };
 
-    log("PokeSurvivor AutoBot 0.6.0 loaded");
+    log(
+        "PokeSurvivor AutoBot 0.7.0 loaded"
+    );
+
 })();
