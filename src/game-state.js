@@ -14,6 +14,11 @@ import {
     isWasmReady
 } from "./wasm-hook.js";
 
+import {
+    getField,
+    hasField
+} from "./wasm-fields.js";
+
 
 // ============================================================
 // GAME STATE
@@ -129,6 +134,26 @@ export function readField(
 
         return null;
     }
+}
+// ============================================================
+// READ NAMED FIELD
+// ============================================================
+
+export function readNamedField(
+    name,
+    playerId = STATE.playerId
+) {
+
+    const fieldId = getField(name);
+
+    if (fieldId === null) {
+        return null;
+    }
+
+    return readField(
+        fieldId,
+        playerId
+    );
 }
 
 
