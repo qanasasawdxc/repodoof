@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PokeSurvivor AutoBot
 // @namespace    PSBot
-// @version      0.9.0
-// @description  WASM game lifecycle/input inspector
+// @version      1.0.0
+// @description  PokeSurvivor worker/WASM inspector
 // @match        https://pokesurvivor.doofcraft.com/*
 // @run-at       document-start
 // @grant        none
@@ -14,435 +14,260 @@
     const TAG = '[PSBot]';
 
     const state = {
-        wasm: false,
-        instance: null,
-        originalExports: null,
-        exports: null,
-
-        handle: null,
-
-        initCalls: [],
-        simCalls: [],
-        createCalls: [],
-        restoreCalls: [],
-        loadCalls: [],
-        lifecycleCalls: [],
-        inputCalls: [],
-
-        players: [],
-        counts: null,
-
-        error: null
+        workers: [],
+        messagesOut: [],
+        messagesIn: [],
+        workerErrors: [],
+        workerSource: null
     };
 
     window.PokeSurvivorBot = {
         state
     };
 
-    console.log(TAG, 'PokeSurvivor AutoBot 0.9.0 loaded');
+    console.log(TAG, 'PokeSurvivor AutoBot 1.0.0 loaded');
 
-    const td = new TextDecoder();
-
-    function readString(memory, ptr, len) {
+    function safeString(value) {
         try {
-            if (!memory || !ptr || !len) return null;
-
-            const bytes = new Uint8Array(memory.buffer, ptr, len);
-            return td.decode(bytes);
-        } catch {
-            return null;
-        }
-    }
-
-    function safeJson(text) {
-        if (typeof text !== 'string') return text;
-
-        try {
-            return JSON.parse(text);
-        } catch {
-            return text;
-        }
-    }
-
-    function logCall(name, args, result) {
-        const rec = {
-            time: performance.now(),
-            args: Array.from(args),
-            result
-        };
-
-        state.lifecycleCalls.push({
-            name,
-            ...rec
-        });
-
-        if (state.lifecycleCalls.length > 500) {
-            state.lifecycleCalls.shift();
-        }
-
-        console.log(TAG, name, rec);
-
-        return result;
-    }
-
-    function makeWrappedExports(original, memory) {
-        const wrapped = {};
-
-        for (const name of Object.keys(original)) {
-            const fn = original[name];
-
-            if (typeof fn !== 'function') {
-                wrapped[name] = fn;
-                continue;
+            if (typeof value === 'string') {
+                return value;
             }
 
-            wrapped[name] = function (...args) {
-                let result;
+            if (value instanceof ArrayBuffer) {
+                return `[ArrayBuffer ${value.byteLength}]`;
+            }
 
-                try {
-                    result = fn(...args);
-                } catch (e) {
-                    console.error(TAG, name, 'ERROR', e);
-                    state.error = {
-                        name,
-                        message: String(e)
-                    };
-                    throw e;
-                }
+            if (ArrayBuffer.isView(value)) {
+                return `[${value.constructor.name} ${value.byteLength}]`;
+            }
 
-                // ---- init ----
-                if (name === 'init') {
-                    state.initCalls.push({
-                        args: [...args],
-                        result
-                    });
-
-                    console.log(TAG, 'WASM init()', args);
-                    console.log(TAG, 'WASM init RESULT =', result);
-                }
-
-                // ---- sim_call ----
-                if (name === 'sim_call') {
-                    state.simCalls.push({
-                        args: [...args],
-                        result,
-                        time: performance.now()
-                    });
-
-                    console.log(TAG, 'sim_call:', {
-                        args: [...args],
-                        result,
-                        time: performance.now()
-                    });
-                }
-
-                // ---- game_create ----
-                if (name === 'game_create') {
-                    state.createCalls.push({
-                        args: [...args],
-                        result
-                    });
-
-                    state.handle = result;
-
-                    console.log(
-                        TAG,
-                        '!!! game_create !!!',
-                        'args =',
-                        [...args],
-                        'handle =',
-                        result
-                    );
-                }
-
-                // ---- game_restore ----
-                if (name === 'game_restore') {
-                    state.restoreCalls.push({
-                        args: [...args],
-                        result
-                    });
-
-                    state.handle = result;
-
-                    console.log(
-                        TAG,
-                        '!!! game_restore !!!',
-                        'args =',
-                        [...args],
-                        'handle =',
-                        result
-                    );
-                }
-
-                // ---- game_load ----
-                if (name === 'game_load') {
-                    state.loadCalls.push({
-                        args: [...args],
-                        result
-                    });
-
-                    console.log(
-                        TAG,
-                        '!!! game_load !!!',
-                        'args =',
-                        [...args],
-                        'result =',
-                        result
-                    );
-                }
-
-                // ---- game_set_input ----
-                if (name === 'game_set_input') {
-                    const rec = {
-                        args: [...args],
-                        time: performance.now()
-                    };
-
-                    state.inputCalls.push(rec);
-
-                    console.log(
-                        TAG,
-                        '!!! game_set_input !!!',
-                        rec
-                    );
-                }
-
-                // ---- common lifecycle ----
-                const interesting = [
-                    'game_add_viewer',
-                    'game_drop_viewer',
-                    'game_reset_viewer',
-                    'game_reset_viewer_timeline',
-                    'game_set_connected',
-                    'game_set_focus',
-                    'game_begin_round',
-                    'game_after_tick',
-                    'game_end_round',
-                    'game_hold_for_resume',
-                    'game_resume_in',
-                    'game_remove_player',
-                    'game_enable_choice_afk',
-                    'game_submit_intent',
-                    'game_note_steering',
-                    'game_step',
-                    'game_tick',
-                    'game_encode',
-                    'game_save',
-                    'game_state_field',
-                    'game_player',
-                    'game_counts',
-                    'game_summary',
-                    'game_results'
-                ];
-
-                if (interesting.includes(name)) {
-                    logCall(name, args, result);
-                }
-
-                // ---- decode common JSON-returning functions ----
-                if (
-                    name === 'game_player' ||
-                    name === 'game_counts' ||
-                    name === 'game_summary' ||
-                    name === 'game_results' ||
-                    name === 'game_state_field' ||
-                    name === 'game_submit_intent' ||
-                    name === 'game_encode'
-                ) {
-                    try {
-                        if (typeof result === 'number') {
-                            console.log(
-                                TAG,
-                                name,
-                                'returned pointer/handle:',
-                                result
-                            );
-                        }
-                    } catch {}
-                }
-
-                return result;
-            };
+            return JSON.stringify(value);
+        } catch {
+            return String(value);
         }
-
-        return wrapped;
     }
 
-    async function handleInstance(source, instance, mode) {
+    // ============================================================
+    // Worker
+    // ============================================================
+
+    const OriginalWorker = window.Worker;
+
+    window.Worker = function (...args) {
+        console.log(TAG, '!!! NEW WORKER !!!', args);
+
+        let worker;
+
         try {
-            const original = instance.exports;
-
-            state.wasm = true;
-            state.instance = instance;
-            state.originalExports = original;
-
-            console.log(
-                TAG,
-                'GAME WASM DETECTED:',
-                mode
-            );
-
-            console.log(
-                TAG,
-                'EXPORTS:',
-                Object.keys(original)
-            );
-
-            const wrapped = makeWrappedExports(
-                original,
-                original.memory
-            );
-
-            state.exports = wrapped;
-
-            /*
-             * IMPORTANT:
-             *
-             * We cannot replace instance.exports because WebAssembly
-             * exports are read-only/invariant objects.
-             *
-             * Instead we temporarily replace the returned instance
-             * with an object whose exports point at our wrappers.
-             */
-            return {
-                ...instance,
-                exports: wrapped
-            };
-
+            worker = new OriginalWorker(...args);
         } catch (e) {
-            console.error(TAG, 'handleInstance failed', e);
-            state.error = e;
-            return instance;
+            console.error(TAG, 'Worker creation failed', e);
+            throw e;
         }
-    }
 
-    // ============================================================
-    // WebAssembly.instantiate
-    // ============================================================
+        const id = state.workers.length;
 
-    const originalInstantiate =
-        WebAssembly.instantiate.bind(WebAssembly);
+        const info = {
+            id,
+            url: args[0],
+            options: args[1] || null,
+            worker,
+            createdAt: performance.now()
+        };
 
-    WebAssembly.instantiate = async function (...args) {
-        console.log(TAG, 'WebAssembly.instantiate()');
+        state.workers.push(info);
 
-        const result =
-            await originalInstantiate(...args);
+        console.log(
+            TAG,
+            'WORKER #' + id,
+            'URL =',
+            args[0]
+        );
 
-        if (
-            result &&
-            result.instance &&
-            result.instance.exports
-        ) {
-            const patched =
-                await handleInstance(
-                    args[0],
-                    result.instance,
-                    'normal'
-                );
+        // --------------------------------------------------------
+        // postMessage OUT
+        // --------------------------------------------------------
 
-            return {
-                module: result.module,
-                instance: patched
+        const originalPostMessage =
+            worker.postMessage.bind(worker);
+
+        worker.postMessage = function (...messageArgs) {
+            const record = {
+                worker: id,
+                time: performance.now(),
+                data: messageArgs[0],
+                transferCount:
+                    messageArgs[1]?.length || 0
             };
-        }
 
-        // instantiate(BufferSource) may directly return instance
-        if (
-            result &&
-            result.exports
-        ) {
-            return await handleInstance(
-                args[0],
-                result,
-                'normal-direct'
+            state.messagesOut.push(record);
+
+            if (state.messagesOut.length > 300) {
+                state.messagesOut.shift();
+            }
+
+            console.log(
+                TAG,
+                'WORKER #' + id,
+                '→ postMessage',
+                record
             );
-        }
 
-        return result;
-    };
+            return originalPostMessage(...messageArgs);
+        };
 
-    // ============================================================
-    // WebAssembly.instantiateStreaming
-    // ============================================================
+        // --------------------------------------------------------
+        // message IN
+        // --------------------------------------------------------
 
-    const originalStreaming =
-        WebAssembly.instantiateStreaming.bind(WebAssembly);
+        worker.addEventListener(
+            'message',
+            function (event) {
+                const record = {
+                    worker: id,
+                    time: performance.now(),
+                    data: event.data
+                };
 
-    WebAssembly.instantiateStreaming = async function (...args) {
-        console.log(TAG, 'WebAssembly.instantiateStreaming()');
+                state.messagesIn.push(record);
 
-        const result =
-            await originalStreaming(...args);
+                if (state.messagesIn.length > 300) {
+                    state.messagesIn.shift();
+                }
 
-        if (
-            result &&
-            result.instance &&
-            result.instance.exports
-        ) {
-            const patched =
-                await handleInstance(
-                    args[0],
-                    result.instance,
-                    'streaming'
+                console.log(
+                    TAG,
+                    'WORKER #' + id,
+                    '← message',
+                    record
                 );
+            }
+        );
 
-            return {
-                module: result.module,
-                instance: patched
-            };
-        }
+        worker.addEventListener(
+            'error',
+            function (event) {
+                const record = {
+                    worker: id,
+                    time: performance.now(),
+                    message: event.message,
+                    filename: event.filename,
+                    lineno: event.lineno
+                };
 
-        return result;
+                state.workerErrors.push(record);
+
+                console.error(
+                    TAG,
+                    'WORKER #' + id,
+                    'ERROR',
+                    record
+                );
+            }
+        );
+
+        return worker;
     };
 
+    // Preserve Worker prototype/static properties
+    try {
+        Object.setPrototypeOf(
+            window.Worker,
+            OriginalWorker
+        );
+
+        window.Worker.prototype =
+            OriginalWorker.prototype;
+    } catch {}
+
     // ============================================================
-    // Diagnostic helpers
+    // Fetch worker source
     // ============================================================
 
-    window.PokeSurvivorBot.dump = function () {
-        console.group(TAG, 'STATE');
+    fetch('/assets/worker-CfUXqYFh.js')
+        .then(r => r.text())
+        .then(text => {
+            state.workerSource = text;
 
-        console.log('wasm =', state.wasm);
-        console.log('handle =', state.handle);
+            console.log(
+                TAG,
+                'worker-CfUXqYFh.js captured:',
+                text.length,
+                'bytes'
+            );
+
+            // Show useful keywords
+            const keywords = [
+                'WebAssembly',
+                'instantiate',
+                'game_create',
+                'game_restore',
+                'game_set_input',
+                'game_tick',
+                'postMessage',
+                'onmessage',
+                'setInput',
+                'sim_call'
+            ];
+
+            for (const keyword of keywords) {
+                if (text.includes(keyword)) {
+                    console.log(
+                        TAG,
+                        'worker contains:',
+                        keyword
+                    );
+                }
+            }
+        })
+        .catch(e => {
+            console.warn(
+                TAG,
+                'Could not fetch worker source:',
+                e
+            );
+        });
+
+    // ============================================================
+    // Helpers
+    // ============================================================
+
+    window.PokeSurvivorBot.dumpWorkers = function () {
+        console.group(TAG, 'WORKERS');
 
         console.log(
-            'createCalls =',
-            state.createCalls
+            'workers:',
+            state.workers.map(w => ({
+                id: w.id,
+                url: w.url,
+                createdAt: w.createdAt
+            }))
         );
 
         console.log(
-            'restoreCalls =',
-            state.restoreCalls
+            'messages OUT:',
+            state.messagesOut.slice(-30)
         );
 
         console.log(
-            'loadCalls =',
-            state.loadCalls
+            'messages IN:',
+            state.messagesIn.slice(-30)
         );
 
         console.log(
-            'inputCalls =',
-            state.inputCalls.slice(-20)
-        );
-
-        console.log(
-            'lifecycleCalls =',
-            state.lifecycleCalls.slice(-50)
+            'errors:',
+            state.workerErrors
         );
 
         console.groupEnd();
     };
 
-    window.PokeSurvivorBot.resetLogs = function () {
-        state.createCalls.length = 0;
-        state.restoreCalls.length = 0;
-        state.loadCalls.length = 0;
-        state.lifecycleCalls.length = 0;
-        state.inputCalls.length = 0;
-        state.simCalls.length = 0;
+    window.PokeSurvivorBot.clearLogs = function () {
+        state.messagesOut.length = 0;
+        state.messagesIn.length = 0;
+        state.workerErrors.length = 0;
 
-        console.log(TAG, 'logs cleared');
+        console.log(TAG, 'worker logs cleared');
     };
 
 })();
