@@ -1,446 +1,455 @@
+
 // ==UserScript==
 // @name         PokeSurvivor AutoBot
 // @namespace    PSBot
-// @version      1.1.0
-// @description  PokeSurvivor main-world Worker/WASM inspector
+// @version      1.2.0
 // @match        https://pokesurvivor.doofcraft.com/*
 // @run-at       document-start
-// @grant        none
+// @grant        unsafeWindow
 // ==/UserScript==
 
-(function () {
-    'use strict';
+(() => {
+    "use strict";
 
-    const TAG = '[PSBot]';
+    const W = typeof unsafeWindow !== "undefined"
+        ? unsafeWindow
+        : window;
 
-    /*
-     * ============================================================
-     * MAIN-WORLD PAYLOAD
-     * ============================================================
-     *
-     * Userscript world != page world on Safari.
-     *
-     * Therefore all Worker/WASM hooks must be installed inside
-     * the page's own JS realm.
-     */
+    const VERSION = "1.2.0";
 
-    const payload = 
-(function () {
-    'use strict';
+    // =========================================================
+    // MAIN WORLD CODE
+    // =========================================================
 
-    if (window.__PSBOT_MAIN_HOOK__) {
-        console.log('[PSBot] main hook already installed');
-        return;
-    }
+    const MAIN = 
+(() => {
+    if (window.__PSBOT_MAIN_120__) return;
+    window.__PSBOT_MAIN_120__ = true;
 
-    window.__PSBOT_MAIN_HOOK__ = true;
-
-    const TAG = '[PSBot]';
+    console.log("[PSBot] MAIN 1.2.0 installed");
 
     const state = {
         workers: [],
         messagesOut: [],
         messagesIn: [],
         workerErrors: [],
-        workerSource: null,
-
         wasmInstances: [],
-        wasmCalls: []
+        wasmCalls: [],
+        workerSource: null,
+        seq: 0
     };
 
-    window.__PSBOT_MAIN_STATE__ = state;
+    window.__PSBOT_STATE__ = state;
 
-    console.log(TAG, 'MAIN WORLD HOOK INSTALLED');
+    // ---------------------------------------------------------
+    // Find Worker source
+    // ---------------------------------------------------------
 
-    // ============================================================
+    fetch("/assets/worker-CfUXqYFh.js")
+        .then(r => r.text())
+        .then(src => {
+            state.workerSource = src;
+
+            console.log(
+                "[PSBot] worker source:",
+                src.length,
+                "bytes"
+            );
+        })
+        .catch(e => {
+            console.warn("[PSBot] worker source error", e);
+        });
+
+    // ---------------------------------------------------------
     // Worker hook
-    // ============================================================
+    // ---------------------------------------------------------
 
     const NativeWorker = window.Worker;
 
-    function HookedWorker(...args) {
-        console.log(TAG, '!!! MAIN WORLD NEW WORKER !!!', args);
+    class PSBotWorker extends NativeWorker {
 
-        const worker = new NativeWorker(...args);
+        constructor(url, options) {
 
-        const id = state.workers.length;
+            console.log("[PSBot] NEW WORKER:", String(url));
 
-        const info = {
-            id,
-            url: args[0],
-            options: args[1] || null,
-            worker,
-            createdAt: performance.now()
-        };
+            super(url, options);
 
-        state.workers.push(info);
+            const index = state.workers.length;
 
-        console.log(
-            TAG,
-            'WORKER #' + id,
-            'URL =',
-            args[0]
-        );
-
-        // --------------------------------------------------------
-        // Capture postMessage
-        // --------------------------------------------------------
-
-        const nativePost =
-            worker.postMessage.bind(worker);
-
-        worker.postMessage = function (...msgArgs) {
-            const record = {
-                worker: id,
-                time: performance.now(),
-                data: msgArgs[0],
-                transfer:
-                    msgArgs[1]?.length || 0
-            };
-
-            state.messagesOut.push(record);
-
-            if (state.messagesOut.length > 500) {
-                state.messagesOut.shift();
-            }
-
-            console.log(
-                TAG,
-                'WORKER #' + id,
-                '→',
-                record
-            );
-
-            return nativePost(...msgArgs);
-        };
-
-        // --------------------------------------------------------
-        // Capture incoming messages
-        // --------------------------------------------------------
-
-        worker.addEventListener(
-            'message',
-            event => {
-                const record = {
-                    worker: id,
-                    time: performance.now(),
-                    data: event.data
-                };
-
-                state.messagesIn.push(record);
-
-                if (state.messagesIn.length > 500) {
-                    state.messagesIn.shift();
-                }
-
-                console.log(
-                    TAG,
-                    'WORKER #' + id,
-                    '←',
-                    record
-                );
-            }
-        );
-
-        worker.addEventListener(
-            'error',
-            event => {
-                const record = {
-                    worker: id,
-                    time: performance.now(),
-                    message: event.message,
-                    filename: event.filename,
-                    line: event.lineno
-                };
-
-                state.workerErrors.push(record);
-
-                console.error(
-                    TAG,
-                    'WORKER ERROR',
-                    record
-                );
-            }
-        );
-
-        return worker;
-    }
-
-    /*
-     * Preserve Worker prototype.
-     *
-     * Some browsers inspect Worker.prototype when constructing
-     * workers.
-     */
-    try {
-        Object.setPrototypeOf(
-            HookedWorker,
-            NativeWorker
-        );
-
-        HookedWorker.prototype =
-            NativeWorker.prototype;
-    } catch (e) {
-        console.warn(
-            TAG,
-            'could not preserve Worker prototype',
-            e
-        );
-    }
-
-    window.Worker = HookedWorker;
-
-    // ============================================================
-    // WASM hooks inside MAIN WORLD
-    // ============================================================
-
-    const nativeInstantiate =
-        WebAssembly.instantiate;
-
-    const nativeStreaming =
-        WebAssembly.instantiateStreaming;
-
-    async function inspectInstance(instance, mode) {
-        try {
-            if (!instance || !instance.exports) {
-                return instance;
-            }
-
-            const names =
-                Object.keys(instance.exports);
-
-            console.log(
-                TAG,
-                'MAIN WORLD WASM:',
-                mode,
-                names
-            );
-
-            state.wasmInstances.push({
-                mode,
-                instance,
-                exports: names,
-                time: performance.now()
+            state.workers.push({
+                index,
+                worker: this,
+                url: String(url),
+                created: performance.now()
             });
 
-            /*
-             * Wrap selected exports.
-             *
-             * We do NOT replace instance.exports.
-             * Instead this is diagnostic only.
-             */
-            const original = instance.exports;
+            window.__PSBOT_WORKER__ = this;
+            window.__PSBOT_WORKER_INDEX__ = index;
 
-            for (const name of [
-                'game_create',
-                'game_restore',
-                'game_load',
-                'game_set_input',
-                'game_tick',
-                'game_begin_round',
-                'game_set_connected',
-                'game_set_focus',
-                'game_submit_intent'
-            ]) {
-                if (typeof original[name] !== 'function') {
-                    continue;
-                }
-
-                console.log(
-                    TAG,
-                    'MAIN WASM EXPORT FOUND:',
-                    name
-                );
-            }
-
-        } catch (e) {
-            console.error(
-                TAG,
-                'inspectInstance failed',
-                e
+            console.log(
+                "[PSBot] WORKER SAVED #",
+                index,
+                this
             );
-        }
 
-        return instance;
+            // -------------------------------------------------
+            // Capture outgoing messages
+            // -------------------------------------------------
+
+            const nativePostMessage =
+                this.postMessage.bind(this);
+
+            this.postMessage = function(data, transfer) {
+
+                try {
+                    state.messagesOut.push({
+                        time: performance.now(),
+                        data: structuredClone
+                            ? structuredClone(data)
+                            : data
+                    });
+
+                    if (state.messagesOut.length > 500)
+                        state.messagesOut.shift();
+
+                    if (data && data.type === "input") {
+                        console.log(
+                            "[PSBot] GAME INPUT",
+                            data
+                        );
+                    }
+
+                } catch (e) {}
+
+                return nativePostMessage(data, transfer);
+            };
+
+            // -------------------------------------------------
+            // Incoming messages
+            // -------------------------------------------------
+
+            this.addEventListener("message", e => {
+
+                try {
+
+                    const data = e.data;
+
+                    state.messagesIn.push({
+                        time: performance.now(),
+                        data: structuredClone
+                            ? structuredClone(data)
+                            : data
+                    });
+
+                    if (state.messagesIn.length > 500)
+                        state.messagesIn.shift();
+
+                    if (data && data.type) {
+                        console.log(
+                            "[PSBot] GAME MESSAGE",
+                            data.type,
+                            data
+                        );
+                    }
+
+                } catch (err) {}
+            });
+
+            this.addEventListener("error", e => {
+                state.workerErrors.push({
+                    time: performance.now(),
+                    message: e.message || String(e)
+                });
+
+                console.error("[PSBot] WORKER ERROR", e);
+            });
+        }
     }
 
-    WebAssembly.instantiate = async function (...args) {
-        console.log(
-            TAG,
-            'MAIN WORLD WebAssembly.instantiate'
-        );
+    window.Worker = PSBotWorker;
 
-        const result =
-            await nativeInstantiate(...args);
+    // ---------------------------------------------------------
+    // Direct input API
+    // ---------------------------------------------------------
 
-        if (result?.instance) {
-            await inspectInstance(
-                result.instance,
-                'instantiate'
-            );
-        } else if (result?.exports) {
-            await inspectInstance(
-                result,
-                'instantiate-direct'
-            );
+    window.__PSBOT_INPUT__ = function(
+        moveX = 0,
+        moveY = 0,
+        slot = null,
+        aim = null,
+        fire = false
+    ) {
+
+        const worker = window.__PSBOT_WORKER__;
+
+        if (!worker) {
+            console.warn("[PSBot] No game worker");
+            return false;
         }
 
-        return result;
-    };
-
-    WebAssembly.instantiateStreaming =
-        async function (...args) {
-            console.log(
-                TAG,
-                'MAIN WORLD WebAssembly.instantiateStreaming'
-            );
-
-            const result =
-                await nativeStreaming(...args);
-
-            if (result?.instance) {
-                await inspectInstance(
-                    result.instance,
-                    'streaming'
-                );
-            }
-
-            return result;
+        const msg = {
+            type: "input",
+            seq: ++state.seq,
+            moveX: Number(moveX) || 0,
+            moveY: Number(moveY) || 0,
+            slot: slot == null ? null : slot,
+            aim: aim == null ? null : aim,
+            fire: !!fire
         };
 
-    // ============================================================
-    // Fetch worker source
-    // ============================================================
+        worker.postMessage(msg);
 
-    fetch('/assets/worker-CfUXqYFh.js')
-        .then(r => r.text())
-        .then(text => {
-            state.workerSource = text;
+        return msg;
+    };
 
-            console.log(
-                TAG,
-                'MAIN worker source:',
-                text.length,
-                'bytes'
+    // ---------------------------------------------------------
+    // Stop movement
+    // ---------------------------------------------------------
+
+    window.__PSBOT_STOP__ = function() {
+
+        return window.__PSBOT_INPUT__(
+            0,
+            0,
+            null,
+            null,
+            false
+        );
+    };
+
+    // ---------------------------------------------------------
+    // Hold direction continuously
+    // ---------------------------------------------------------
+
+    let movementTimer = null;
+
+    window.__PSBOT_MOVE__ = function(
+        moveX,
+        moveY
+    ) {
+
+        if (movementTimer)
+            clearInterval(movementTimer);
+
+        const send = () => {
+
+            window.__PSBOT_INPUT__(
+                moveX,
+                moveY,
+                null,
+                null,
+                false
             );
+        };
 
-            const keys = [
-                'game_create',
-                'game_restore',
-                'game_set_input',
-                'game_tick',
-                'setInput',
-                'postMessage',
-                'onmessage',
-                'sim_call'
-            ];
+        send();
 
-            for (const key of keys) {
-                if (text.includes(key)) {
-                    console.log(
-                        TAG,
-                        'worker contains:',
-                        key
-                    );
-                }
-            }
-        })
-        .catch(e => {
-            console.warn(
-                TAG,
-                'worker source fetch failed',
-                e
-            );
-        });
+        movementTimer = setInterval(
+            send,
+            30
+        );
 
+        return true;
+    };
+
+    window.__PSBOT_STOP_MOVE__ = function() {
+
+        if (movementTimer) {
+            clearInterval(movementTimer);
+            movementTimer = null;
+        }
+
+        return window.__PSBOT_STOP__();
+    };
+
+    // ---------------------------------------------------------
+    // Debug
+    // ---------------------------------------------------------
+
+    window.__PSBOT_DUMP__ = function() {
+
+        console.log(
+            "[PSBot] workers:",
+            state.workers
+        );
+
+        console.log(
+            "[PSBot] OUT:",
+            state.messagesOut
+        );
+
+        console.log(
+            "[PSBot] IN:",
+            state.messagesIn
+        );
+
+        console.log(
+            "[PSBot] WASM:",
+            state.wasmInstances
+        );
+
+        console.log(
+            "[PSBot] errors:",
+            state.workerErrors
+        );
+
+        return state;
+    };
+
+    console.log("[PSBot] MAIN WORLD READY");
 })();
 ;
 
-    /*
-     * ============================================================
-     * Inject into MAIN world
-     * ============================================================
-     */
+    // =========================================================
+    // Inject MAIN WORLD
+    // =========================================================
 
-    const script = document.createElement('script');
+    function inject() {
 
-    script.textContent = payload;
+        const script = document.createElement("script");
 
-    /*
-     * CSP may block inline scripts on some sites.
-     * PokeSurvivor normally allows this injection path.
-     */
+        script.textContent = MAIN;
 
-    (document.documentElement ||
-     document.head ||
-     document.body).appendChild(script);
+        (
+            document.documentElement ||
+            document.head ||
+            document.body
+        ).appendChild(script);
 
-    script.remove();
+        script.remove();
 
-    console.log(
-        TAG,
-        'Userscript bridge injected'
-    );
+        console.log(
+            "[PSBot] Userscript bridge injected"
+        );
+    }
 
-    // ============================================================
-    // Userscript-side state
-    // ============================================================
+    // document-start may happen before <html>
+    if (document.documentElement) {
+        inject();
+    } else {
+        new MutationObserver(() => {
 
-    window.PokeSurvivorBot = {
-        state: {
-            get main() {
-                return window.__PSBOT_MAIN_STATE__;
+            if (document.documentElement) {
+                inject();
+                return;
             }
+
+        }).observe(document, {
+            childList: true,
+            subtree: true
+        });
+    }
+
+    // =========================================================
+    // Userscript API
+    // =========================================================
+
+    W.PokeSurvivorBot = {
+
+        version: VERSION,
+
+        state: {
+
+            get main() {
+                return W.__PSBOT_STATE__;
+            }
+
         },
 
         dump() {
-            const s =
-                window.__PSBOT_MAIN_STATE__;
+
+            const s = W.__PSBOT_STATE__;
 
             if (!s) {
                 console.warn(
-                    TAG,
-                    'MAIN WORLD STATE NOT FOUND'
+                    "[PSBot] MAIN state not ready"
                 );
                 return;
             }
 
-            console.group(
-                TAG,
-                'MAIN WORLD'
+            console.log(
+                "[PSBot] MAIN WORLD"
             );
 
             console.log(
-                'workers:',
-                s.workers.map(w => ({
-                    id: w.id,
-                    url: w.url,
-                    createdAt: w.createdAt
-                }))
+                "workers:",
+                s.workers
             );
 
             console.log(
-                'wasm:',
+                "wasm:",
                 s.wasmInstances
             );
 
             console.log(
-                'OUT:',
-                s.messagesOut.slice(-30)
+                "OUT:",
+                s.messagesOut
             );
 
             console.log(
-                'IN:',
-                s.messagesIn.slice(-30)
+                "IN:",
+                s.messagesIn
             );
 
             console.log(
-                'errors:',
+                "errors:",
                 s.workerErrors
             );
 
-            console.groupEnd();
+            return s;
+        },
+
+        input(
+            moveX = 0,
+            moveY = 0,
+            slot = null,
+            aim = null,
+            fire = false
+        ) {
+
+            if (!W.__PSBOT_INPUT__) {
+                console.warn(
+                    "[PSBot] input API not ready"
+                );
+                return;
+            }
+
+            return W.__PSBOT_INPUT__(
+                moveX,
+                moveY,
+                slot,
+                aim,
+                fire
+            );
+        },
+
+        move(moveX, moveY) {
+
+            if (!W.__PSBOT_MOVE__) {
+                console.warn(
+                    "[PSBot] move API not ready"
+                );
+                return;
+            }
+
+            return W.__PSBOT_MOVE__(
+                moveX,
+                moveY
+            );
+        },
+
+        stop() {
+
+            if (W.__PSBOT_STOP_MOVE__)
+                return W.__PSBOT_STOP_MOVE__();
+
         }
     };
+
+    console.log(
+        "[PSBot] PokeSurvivor AutoBot",
+        VERSION,
+        "loaded"
+    );
 
 })();
