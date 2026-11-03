@@ -1,4 +1,3 @@
-
 // ==UserScript==
 // @name         PokeSurvivor AutoBot
 // @namespace    PSBot
@@ -447,4 +446,3 @@
     };
 
 })();
-```
