@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PokeSurvivor AutoBot
 // @namespace    PSBot
-// @version      1.0.0
-// @description  PokeSurvivor worker/WASM inspector
+// @version      1.1.0
+// @description  PokeSurvivor main-world Worker/WASM inspector
 // @match        https://pokesurvivor.doofcraft.com/*
 // @run-at       document-start
 // @grant        none
@@ -13,57 +13,55 @@
 
     const TAG = '[PSBot]';
 
+    /*
+     * ============================================================
+     * MAIN-WORLD PAYLOAD
+     * ============================================================
+     *
+     * Userscript world != page world on Safari.
+     *
+     * Therefore all Worker/WASM hooks must be installed inside
+     * the page's own JS realm.
+     */
+
+    const payload = 
+(function () {
+    'use strict';
+
+    if (window.__PSBOT_MAIN_HOOK__) {
+        console.log('[PSBot] main hook already installed');
+        return;
+    }
+
+    window.__PSBOT_MAIN_HOOK__ = true;
+
+    const TAG = '[PSBot]';
+
     const state = {
         workers: [],
         messagesOut: [],
         messagesIn: [],
         workerErrors: [],
-        workerSource: null
+        workerSource: null,
+
+        wasmInstances: [],
+        wasmCalls: []
     };
 
-    window.PokeSurvivorBot = {
-        state
-    };
+    window.__PSBOT_MAIN_STATE__ = state;
 
-    console.log(TAG, 'PokeSurvivor AutoBot 1.0.0 loaded');
-
-    function safeString(value) {
-        try {
-            if (typeof value === 'string') {
-                return value;
-            }
-
-            if (value instanceof ArrayBuffer) {
-                return `[ArrayBuffer ${value.byteLength}]`;
-            }
-
-            if (ArrayBuffer.isView(value)) {
-                return `[${value.constructor.name} ${value.byteLength}]`;
-            }
-
-            return JSON.stringify(value);
-        } catch {
-            return String(value);
-        }
-    }
+    console.log(TAG, 'MAIN WORLD HOOK INSTALLED');
 
     // ============================================================
-    // Worker
+    // Worker hook
     // ============================================================
 
-    const OriginalWorker = window.Worker;
+    const NativeWorker = window.Worker;
 
-    window.Worker = function (...args) {
-        console.log(TAG, '!!! NEW WORKER !!!', args);
+    function HookedWorker(...args) {
+        console.log(TAG, '!!! MAIN WORLD NEW WORKER !!!', args);
 
-        let worker;
-
-        try {
-            worker = new OriginalWorker(...args);
-        } catch (e) {
-            console.error(TAG, 'Worker creation failed', e);
-            throw e;
-        }
+        const worker = new NativeWorker(...args);
 
         const id = state.workers.length;
 
@@ -85,44 +83,44 @@
         );
 
         // --------------------------------------------------------
-        // postMessage OUT
+        // Capture postMessage
         // --------------------------------------------------------
 
-        const originalPostMessage =
+        const nativePost =
             worker.postMessage.bind(worker);
 
-        worker.postMessage = function (...messageArgs) {
+        worker.postMessage = function (...msgArgs) {
             const record = {
                 worker: id,
                 time: performance.now(),
-                data: messageArgs[0],
-                transferCount:
-                    messageArgs[1]?.length || 0
+                data: msgArgs[0],
+                transfer:
+                    msgArgs[1]?.length || 0
             };
 
             state.messagesOut.push(record);
 
-            if (state.messagesOut.length > 300) {
+            if (state.messagesOut.length > 500) {
                 state.messagesOut.shift();
             }
 
             console.log(
                 TAG,
                 'WORKER #' + id,
-                '→ postMessage',
+                '→',
                 record
             );
 
-            return originalPostMessage(...messageArgs);
+            return nativePost(...msgArgs);
         };
 
         // --------------------------------------------------------
-        // message IN
+        // Capture incoming messages
         // --------------------------------------------------------
 
         worker.addEventListener(
             'message',
-            function (event) {
+            event => {
                 const record = {
                     worker: id,
                     time: performance.now(),
@@ -131,14 +129,14 @@
 
                 state.messagesIn.push(record);
 
-                if (state.messagesIn.length > 300) {
+                if (state.messagesIn.length > 500) {
                     state.messagesIn.shift();
                 }
 
                 console.log(
                     TAG,
                     'WORKER #' + id,
-                    '← message',
+                    '←',
                     record
                 );
             }
@@ -146,39 +144,169 @@
 
         worker.addEventListener(
             'error',
-            function (event) {
+            event => {
                 const record = {
                     worker: id,
                     time: performance.now(),
                     message: event.message,
                     filename: event.filename,
-                    lineno: event.lineno
+                    line: event.lineno
                 };
 
                 state.workerErrors.push(record);
 
                 console.error(
                     TAG,
-                    'WORKER #' + id,
-                    'ERROR',
+                    'WORKER ERROR',
                     record
                 );
             }
         );
 
         return worker;
-    };
+    }
 
-    // Preserve Worker prototype/static properties
+    /*
+     * Preserve Worker prototype.
+     *
+     * Some browsers inspect Worker.prototype when constructing
+     * workers.
+     */
     try {
         Object.setPrototypeOf(
-            window.Worker,
-            OriginalWorker
+            HookedWorker,
+            NativeWorker
         );
 
-        window.Worker.prototype =
-            OriginalWorker.prototype;
-    } catch {}
+        HookedWorker.prototype =
+            NativeWorker.prototype;
+    } catch (e) {
+        console.warn(
+            TAG,
+            'could not preserve Worker prototype',
+            e
+        );
+    }
+
+    window.Worker = HookedWorker;
+
+    // ============================================================
+    // WASM hooks inside MAIN WORLD
+    // ============================================================
+
+    const nativeInstantiate =
+        WebAssembly.instantiate;
+
+    const nativeStreaming =
+        WebAssembly.instantiateStreaming;
+
+    async function inspectInstance(instance, mode) {
+        try {
+            if (!instance || !instance.exports) {
+                return instance;
+            }
+
+            const names =
+                Object.keys(instance.exports);
+
+            console.log(
+                TAG,
+                'MAIN WORLD WASM:',
+                mode,
+                names
+            );
+
+            state.wasmInstances.push({
+                mode,
+                instance,
+                exports: names,
+                time: performance.now()
+            });
+
+            /*
+             * Wrap selected exports.
+             *
+             * We do NOT replace instance.exports.
+             * Instead this is diagnostic only.
+             */
+            const original = instance.exports;
+
+            for (const name of [
+                'game_create',
+                'game_restore',
+                'game_load',
+                'game_set_input',
+                'game_tick',
+                'game_begin_round',
+                'game_set_connected',
+                'game_set_focus',
+                'game_submit_intent'
+            ]) {
+                if (typeof original[name] !== 'function') {
+                    continue;
+                }
+
+                console.log(
+                    TAG,
+                    'MAIN WASM EXPORT FOUND:',
+                    name
+                );
+            }
+
+        } catch (e) {
+            console.error(
+                TAG,
+                'inspectInstance failed',
+                e
+            );
+        }
+
+        return instance;
+    }
+
+    WebAssembly.instantiate = async function (...args) {
+        console.log(
+            TAG,
+            'MAIN WORLD WebAssembly.instantiate'
+        );
+
+        const result =
+            await nativeInstantiate(...args);
+
+        if (result?.instance) {
+            await inspectInstance(
+                result.instance,
+                'instantiate'
+            );
+        } else if (result?.exports) {
+            await inspectInstance(
+                result,
+                'instantiate-direct'
+            );
+        }
+
+        return result;
+    };
+
+    WebAssembly.instantiateStreaming =
+        async function (...args) {
+            console.log(
+                TAG,
+                'MAIN WORLD WebAssembly.instantiateStreaming'
+            );
+
+            const result =
+                await nativeStreaming(...args);
+
+            if (result?.instance) {
+                await inspectInstance(
+                    result.instance,
+                    'streaming'
+                );
+            }
+
+            return result;
+        };
 
     // ============================================================
     // Fetch worker source
@@ -191,31 +319,28 @@
 
             console.log(
                 TAG,
-                'worker-CfUXqYFh.js captured:',
+                'MAIN worker source:',
                 text.length,
                 'bytes'
             );
 
-            // Show useful keywords
-            const keywords = [
-                'WebAssembly',
-                'instantiate',
+            const keys = [
                 'game_create',
                 'game_restore',
                 'game_set_input',
                 'game_tick',
+                'setInput',
                 'postMessage',
                 'onmessage',
-                'setInput',
                 'sim_call'
             ];
 
-            for (const keyword of keywords) {
-                if (text.includes(keyword)) {
+            for (const key of keys) {
+                if (text.includes(key)) {
                     console.log(
                         TAG,
                         'worker contains:',
-                        keyword
+                        key
                     );
                 }
             }
@@ -223,51 +348,99 @@
         .catch(e => {
             console.warn(
                 TAG,
-                'Could not fetch worker source:',
+                'worker source fetch failed',
                 e
             );
         });
 
+})();
+;
+
+    /*
+     * ============================================================
+     * Inject into MAIN world
+     * ============================================================
+     */
+
+    const script = document.createElement('script');
+
+    script.textContent = payload;
+
+    /*
+     * CSP may block inline scripts on some sites.
+     * PokeSurvivor normally allows this injection path.
+     */
+
+    (document.documentElement ||
+     document.head ||
+     document.body).appendChild(script);
+
+    script.remove();
+
+    console.log(
+        TAG,
+        'Userscript bridge injected'
+    );
+
     // ============================================================
-    // Helpers
+    // Userscript-side state
     // ============================================================
 
-    window.PokeSurvivorBot.dumpWorkers = function () {
-        console.group(TAG, 'WORKERS');
+    window.PokeSurvivorBot = {
+        state: {
+            get main() {
+                return window.__PSBOT_MAIN_STATE__;
+            }
+        },
 
-        console.log(
-            'workers:',
-            state.workers.map(w => ({
-                id: w.id,
-                url: w.url,
-                createdAt: w.createdAt
-            }))
-        );
+        dump() {
+            const s =
+                window.__PSBOT_MAIN_STATE__;
 
-        console.log(
-            'messages OUT:',
-            state.messagesOut.slice(-30)
-        );
+            if (!s) {
+                console.warn(
+                    TAG,
+                    'MAIN WORLD STATE NOT FOUND'
+                );
+                return;
+            }
 
-        console.log(
-            'messages IN:',
-            state.messagesIn.slice(-30)
-        );
+            console.group(
+                TAG,
+                'MAIN WORLD'
+            );
 
-        console.log(
-            'errors:',
-            state.workerErrors
-        );
+            console.log(
+                'workers:',
+                s.workers.map(w => ({
+                    id: w.id,
+                    url: w.url,
+                    createdAt: w.createdAt
+                }))
+            );
 
-        console.groupEnd();
-    };
+            console.log(
+                'wasm:',
+                s.wasmInstances
+            );
 
-    window.PokeSurvivorBot.clearLogs = function () {
-        state.messagesOut.length = 0;
-        state.messagesIn.length = 0;
-        state.workerErrors.length = 0;
+            console.log(
+                'OUT:',
+                s.messagesOut.slice(-30)
+            );
 
-        console.log(TAG, 'worker logs cleared');
+            console.log(
+                'IN:',
+                s.messagesIn.slice(-30)
+            );
+
+            console.log(
+                'errors:',
+                s.workerErrors
+            );
+
+            console.groupEnd();
+        }
     };
 
 })();
