@@ -1,16 +1,20 @@
+```javascript
 // ==UserScript==
 // @name         PokeSurvivor AutoBot
-// @namespace    psbot
-// @version      0.8.0
+// @namespace    PSBot
+// @version      0.9.0
+// @description  WASM game lifecycle/input inspector
 // @match        https://pokesurvivor.doofcraft.com/*
 // @run-at       document-start
 // @grant        none
 // ==/UserScript==
 
-(() => {
-    "use strict";
+(function () {
+    'use strict';
 
-    const S = {
+    const TAG = '[PSBot]';
+
+    const state = {
         wasm: false,
         instance: null,
         originalExports: null,
@@ -21,6 +25,9 @@
         initCalls: [],
         simCalls: [],
         createCalls: [],
+        restoreCalls: [],
+        loadCalls: [],
+        lifecycleCalls: [],
         inputCalls: [],
 
         players: [],
@@ -30,96 +37,26 @@
     };
 
     window.PokeSurvivorBot = {
-        state: S,
-
-        status() {
-            return {
-                wasm: S.wasm,
-                handle: S.handle,
-                initCalls: S.initCalls.slice(-10),
-                simCalls: S.simCalls.slice(-10),
-                createCalls: S.createCalls.slice(-10),
-                inputCalls: S.inputCalls.slice(-20),
-                players: S.players,
-                counts: S.counts,
-                error: S.error
-            };
-        }
+        state
     };
 
-    const log = (...args) => {
-        console.log(
-            "%c[PSBot]",
-            "color:#00e5ff;font-weight:bold",
-            ...args
-        );
-    };
+    console.log(TAG, 'PokeSurvivor AutoBot 0.9.0 loaded');
 
-    const warn = (...args) => {
-        console.warn("[PSBot]", ...args);
-    };
+    const td = new TextDecoder();
 
-    const fail = (...args) => {
-        console.error("[PSBot]", ...args);
-    };
-
-    /*
-     * ---------------------------------------------------------
-     * WASM MEMORY
-     * ---------------------------------------------------------
-     */
-
-    function decodeMemory(ptr, len) {
+    function readString(memory, ptr, len) {
         try {
-            const memory =
-                S.originalExports?.memory;
+            if (!memory || !ptr || !len) return null;
 
-            if (!memory)
-                return null;
-
-            if (!Number.isInteger(ptr) ||
-                !Number.isInteger(len))
-                return null;
-
-            if (ptr < 0 || len < 0)
-                return null;
-
-            if (ptr + len > memory.buffer.byteLength)
-                return null;
-
-            return new TextDecoder().decode(
-                new Uint8Array(
-                    memory.buffer,
-                    ptr,
-                    len
-                )
-            );
-
+            const bytes = new Uint8Array(memory.buffer, ptr, len);
+            return td.decode(bytes);
         } catch {
             return null;
         }
     }
 
-    function readReturnString(len) {
-        try {
-            const retPtr =
-                S.originalExports?.ret_ptr;
-
-            if (typeof retPtr !== "function")
-                return null;
-
-            const ptr = retPtr();
-
-            return decodeMemory(ptr, len);
-
-        } catch {
-            return null;
-        }
-    }
-
-    function parseValue(text) {
-        if (typeof text !== "string")
-            return text;
+    function safeJson(text) {
+        if (typeof text !== 'string') return text;
 
         try {
             return JSON.parse(text);
@@ -128,604 +65,386 @@
         }
     }
 
-    /*
-     * ---------------------------------------------------------
-     * PLAYER / COUNTS
-     * ---------------------------------------------------------
-     */
+    function logCall(name, args, result) {
+        const rec = {
+            time: performance.now(),
+            args: Array.from(args),
+            result
+        };
 
-    function inspectPlayers() {
-        if (
-            S.handle == null ||
-            typeof S.originalExports?.game_player !==
-                "function"
-        ) {
-            return;
+        state.lifecycleCalls.push({
+            name,
+            ...rec
+        });
+
+        if (state.lifecycleCalls.length > 500) {
+            state.lifecycleCalls.shift();
         }
 
-        const result = [];
+        console.log(TAG, name, rec);
 
-        for (let i = 0; i < 32; i++) {
-            try {
-                const len =
-                    S.originalExports.game_player(
-                        S.handle,
-                        i
-                    );
-
-                if (!len)
-                    continue;
-
-                const text =
-                    readReturnString(len);
-
-                if (!text)
-                    continue;
-
-                result.push({
-                    index: i,
-                    value: parseValue(text)
-                });
-
-            } catch {
-                break;
-            }
-        }
-
-        S.players = result;
-
-        if (result.length) {
-            log("PLAYERS =", result);
-        }
+        return result;
     }
 
-    function inspectCounts() {
-        if (
-            S.handle == null ||
-            typeof S.originalExports?.game_counts !==
-                "function"
-        ) {
-            return;
-        }
-
-        try {
-            const len =
-                S.originalExports.game_counts(
-                    S.handle
-                );
-
-            if (!len)
-                return;
-
-            const text =
-                readReturnString(len);
-
-            if (!text)
-                return;
-
-            S.counts =
-                parseValue(text);
-
-            log("COUNTS =", S.counts);
-
-        } catch (e) {
-            S.error = String(e);
-        }
-    }
-
-    function inspectGame() {
-        if (S.handle == null)
-            return;
-
-        inspectCounts();
-        inspectPlayers();
-    }
-
-    /*
-     * ---------------------------------------------------------
-     * WRAP EXPORTS
-     * ---------------------------------------------------------
-     *
-     * Không Proxy WebAssembly.Exports.
-     * Tạo object mới để tránh lỗi read-only/non-configurable.
-     */
-
-    function createWrappedExports(original) {
+    function makeWrappedExports(original, memory) {
         const wrapped = {};
 
-        for (const prop of Reflect.ownKeys(original)) {
+        for (const name of Object.keys(original)) {
+            const fn = original[name];
 
-            const fn = original[prop];
-
-            /*
-             * Memory / globals / constants
-             */
-            if (typeof fn !== "function") {
-                wrapped[prop] = fn;
+            if (typeof fn !== 'function') {
+                wrapped[name] = fn;
                 continue;
             }
 
-            /*
-             * -------------------------------------------------
-             * init
-             * -------------------------------------------------
-             */
+            wrapped[name] = function (...args) {
+                let result;
 
-            if (prop === "init") {
-                wrapped[prop] =
-                    function (...args) {
+                try {
+                    result = fn(...args);
+                } catch (e) {
+                    console.error(TAG, name, 'ERROR', e);
+                    state.error = {
+                        name,
+                        message: String(e)
+                    };
+                    throw e;
+                }
 
-                        log(
-                            "WASM init()",
-                            args
-                        );
+                // ---- init ----
+                if (name === 'init') {
+                    state.initCalls.push({
+                        args: [...args],
+                        result
+                    });
 
-                        const start =
-                            performance.now();
+                    console.log(TAG, 'WASM init()', args);
+                    console.log(TAG, 'WASM init RESULT =', result);
+                }
 
-                        let result;
+                // ---- sim_call ----
+                if (name === 'sim_call') {
+                    state.simCalls.push({
+                        args: [...args],
+                        result,
+                        time: performance.now()
+                    });
 
-                        try {
-                            result =
-                                Reflect.apply(
-                                    fn,
-                                    original,
-                                    args
-                                );
+                    console.log(TAG, 'sim_call:', {
+                        args: [...args],
+                        result,
+                        time: performance.now()
+                    });
+                }
 
-                            const record = {
-                                args,
-                                result,
-                                time:
-                                    performance.now()
-                                    - start
-                            };
+                // ---- game_create ----
+                if (name === 'game_create') {
+                    state.createCalls.push({
+                        args: [...args],
+                        result
+                    });
 
-                            S.initCalls.push(
-                                record
-                            );
+                    state.handle = result;
 
-                            log(
-                                "WASM init RESULT =",
+                    console.log(
+                        TAG,
+                        '!!! game_create !!!',
+                        'args =',
+                        [...args],
+                        'handle =',
+                        result
+                    );
+                }
+
+                // ---- game_restore ----
+                if (name === 'game_restore') {
+                    state.restoreCalls.push({
+                        args: [...args],
+                        result
+                    });
+
+                    state.handle = result;
+
+                    console.log(
+                        TAG,
+                        '!!! game_restore !!!',
+                        'args =',
+                        [...args],
+                        'handle =',
+                        result
+                    );
+                }
+
+                // ---- game_load ----
+                if (name === 'game_load') {
+                    state.loadCalls.push({
+                        args: [...args],
+                        result
+                    });
+
+                    console.log(
+                        TAG,
+                        '!!! game_load !!!',
+                        'args =',
+                        [...args],
+                        'result =',
+                        result
+                    );
+                }
+
+                // ---- game_set_input ----
+                if (name === 'game_set_input') {
+                    const rec = {
+                        args: [...args],
+                        time: performance.now()
+                    };
+
+                    state.inputCalls.push(rec);
+
+                    console.log(
+                        TAG,
+                        '!!! game_set_input !!!',
+                        rec
+                    );
+                }
+
+                // ---- common lifecycle ----
+                const interesting = [
+                    'game_add_viewer',
+                    'game_drop_viewer',
+                    'game_reset_viewer',
+                    'game_reset_viewer_timeline',
+                    'game_set_connected',
+                    'game_set_focus',
+                    'game_begin_round',
+                    'game_after_tick',
+                    'game_end_round',
+                    'game_hold_for_resume',
+                    'game_resume_in',
+                    'game_remove_player',
+                    'game_enable_choice_afk',
+                    'game_submit_intent',
+                    'game_note_steering',
+                    'game_step',
+                    'game_tick',
+                    'game_encode',
+                    'game_save',
+                    'game_state_field',
+                    'game_player',
+                    'game_counts',
+                    'game_summary',
+                    'game_results'
+                ];
+
+                if (interesting.includes(name)) {
+                    logCall(name, args, result);
+                }
+
+                // ---- decode common JSON-returning functions ----
+                if (
+                    name === 'game_player' ||
+                    name === 'game_counts' ||
+                    name === 'game_summary' ||
+                    name === 'game_results' ||
+                    name === 'game_state_field' ||
+                    name === 'game_submit_intent' ||
+                    name === 'game_encode'
+                ) {
+                    try {
+                        if (typeof result === 'number') {
+                            console.log(
+                                TAG,
+                                name,
+                                'returned pointer/handle:',
                                 result
                             );
-
-                        } catch (e) {
-                            S.error = String(e);
-                            fail(
-                                "init error:",
-                                e
-                            );
-                            throw e;
                         }
+                    } catch {}
+                }
 
-                        return result;
-                    };
-
-                continue;
-            }
-
-            /*
-             * -------------------------------------------------
-             * sim_call
-             * -------------------------------------------------
-             */
-
-            if (prop === "sim_call") {
-                wrapped[prop] =
-                    function (...args) {
-
-                        const start =
-                            performance.now();
-
-                        let result;
-
-                        try {
-
-                            result =
-                                Reflect.apply(
-                                    fn,
-                                    original,
-                                    args
-                                );
-
-                            const record = {
-                                args,
-                                result,
-                                time:
-                                    performance.now()
-                                    - start
-                            };
-
-                            S.simCalls.push(
-                                record
-                            );
-
-                            if (
-                                S.simCalls.length >
-                                50
-                            ) {
-                                S.simCalls.shift();
-                            }
-
-                            log(
-                                "sim_call:",
-                                record
-                            );
-
-                        } catch (e) {
-                            S.error = String(e);
-
-                            fail(
-                                "sim_call error:",
-                                e
-                            );
-
-                            throw e;
-                        }
-
-                        return result;
-                    };
-
-                continue;
-            }
-
-            /*
-             * -------------------------------------------------
-             * game_create
-             * -------------------------------------------------
-             */
-
-            if (prop === "game_create") {
-                wrapped[prop] =
-                    function (...args) {
-
-                        log(
-                            "game_create ARGS =",
-                            args
-                        );
-
-                        let result;
-
-                        try {
-                            result =
-                                Reflect.apply(
-                                    fn,
-                                    original,
-                                    args
-                                );
-
-                        } catch (e) {
-                            S.error = String(e);
-                            fail(
-                                "game_create error:",
-                                e
-                            );
-                            throw e;
-                        }
-
-                        const record = {
-                            args,
-                            result,
-                            time: performance.now()
-                        };
-
-                        S.createCalls.push(
-                            record
-                        );
-
-                        S.handle = result;
-                        S.wasm = true;
-
-                        log(
-                            "GAME HANDLE =",
-                            result
-                        );
-
-                        setTimeout(
-                            inspectGame,
-                            50
-                        );
-
-                        setTimeout(
-                            inspectGame,
-                            500
-                        );
-
-                        return result;
-                    };
-
-                continue;
-            }
-
-            /*
-             * -------------------------------------------------
-             * game_set_input
-             * -------------------------------------------------
-             */
-
-            if (prop === "game_set_input") {
-                wrapped[prop] =
-                    function (...args) {
-
-                        const [
-                            handle,
-                            playerPtr,
-                            playerLen,
-                            moveX,
-                            moveY,
-                            hasSlot,
-                            slot,
-                            hasAim,
-                            aim,
-                            fire
-                        ] = args;
-
-                        const player =
-                            decodeMemory(
-                                playerPtr,
-                                playerLen
-                            );
-
-                        const data = {
-                            handle,
-                            player,
-                            moveX,
-                            moveY,
-                            hasSlot,
-                            slot,
-                            hasAim,
-                            aim,
-                            fire,
-                            time: performance.now()
-                        };
-
-                        S.inputCalls.push(
-                            data
-                        );
-
-                        if (
-                            S.inputCalls.length >
-                            100
-                        ) {
-                            S.inputCalls.shift();
-                        }
-
-                        log(
-                            "INPUT =",
-                            data
-                        );
-
-                        return Reflect.apply(
-                            fn,
-                            original,
-                            args
-                        );
-                    };
-
-                continue;
-            }
-
-            /*
-             * -------------------------------------------------
-             * game_player
-             * -------------------------------------------------
-             */
-
-            if (prop === "game_player") {
-                wrapped[prop] =
-                    function (...args) {
-
-                        const result =
-                            Reflect.apply(
-                                fn,
-                                original,
-                                args
-                            );
-
-                        try {
-                            const text =
-                                readReturnString(
-                                    result
-                                );
-
-                            if (text) {
-                                log(
-                                    "game_player:",
-                                    args,
-                                    parseValue(text)
-                                );
-                            }
-                        } catch {}
-
-                        return result;
-                    };
-
-                continue;
-            }
-
-            /*
-             * -------------------------------------------------
-             * game_counts
-             * -------------------------------------------------
-             */
-
-            if (prop === "game_counts") {
-                wrapped[prop] =
-                    function (...args) {
-
-                        const result =
-                            Reflect.apply(
-                                fn,
-                                original,
-                                args
-                            );
-
-                        try {
-                            const text =
-                                readReturnString(
-                                    result
-                                );
-
-                            if (text) {
-                                S.counts =
-                                    parseValue(text);
-
-                                log(
-                                    "game_counts:",
-                                    S.counts
-                                );
-                            }
-                        } catch {}
-
-                        return result;
-                    };
-
-                continue;
-            }
-
-            /*
-             * Các hàm khác giữ nguyên.
-             */
-            wrapped[prop] =
-                function (...args) {
-                    return Reflect.apply(
-                        fn,
-                        original,
-                        args
-                    );
-                };
+                return result;
+            };
         }
 
         return wrapped;
     }
 
-    /*
-     * ---------------------------------------------------------
-     * INTERCEPT WASM
-     * ---------------------------------------------------------
-     */
-
-    function intercept(result, source) {
-
+    async function handleInstance(source, instance, mode) {
         try {
+            const original = instance.exports;
 
-            if (
-                !result ||
-                !result.instance ||
-                !result.instance.exports
-            ) {
-                return result;
-            }
+            state.wasm = true;
+            state.instance = instance;
+            state.originalExports = original;
 
-            const instance =
-                result.instance;
-
-            const originalExports =
-                instance.exports;
-
-            S.instance =
-                instance;
-
-            S.originalExports =
-                originalExports;
-
-            S.exports =
-                createWrappedExports(
-                    originalExports
-                );
-
-            S.wasm = true;
-
-            log(
-                "GAME WASM DETECTED:",
-                source
+            console.log(
+                TAG,
+                'GAME WASM DETECTED:',
+                mode
             );
 
-            log(
-                "EXPORTS:",
-                Object.keys(originalExports)
+            console.log(
+                TAG,
+                'EXPORTS:',
+                Object.keys(original)
             );
 
+            const wrapped = makeWrappedExports(
+                original,
+                original.memory
+            );
+
+            state.exports = wrapped;
+
+            /*
+             * IMPORTANT:
+             *
+             * We cannot replace instance.exports because WebAssembly
+             * exports are read-only/invariant objects.
+             *
+             * Instead we temporarily replace the returned instance
+             * with an object whose exports point at our wrappers.
+             */
             return {
-                module: result.module,
-
-                instance: {
-                    exports: S.exports
-                }
+                ...instance,
+                exports: wrapped
             };
 
         } catch (e) {
-
-            S.error = String(e);
-
-            fail(
-                "WASM interception error:",
-                e
-            );
-
-            return result;
+            console.error(TAG, 'handleInstance failed', e);
+            state.error = e;
+            return instance;
         }
     }
 
-    /*
-     * ---------------------------------------------------------
-     * WebAssembly.instantiate
-     * ---------------------------------------------------------
-     */
+    // ============================================================
+    // WebAssembly.instantiate
+    // ============================================================
 
-    const nativeInstantiate =
-        WebAssembly.instantiate;
+    const originalInstantiate =
+        WebAssembly.instantiate.bind(WebAssembly);
 
-    WebAssembly.instantiate =
-        async function (...args) {
+    WebAssembly.instantiate = async function (...args) {
+        console.log(TAG, 'WebAssembly.instantiate()');
 
-            log(
-                "WebAssembly.instantiate()"
-            );
+        const result =
+            await originalInstantiate(...args);
 
-            const result =
-                await nativeInstantiate.apply(
-                    this,
-                    args
+        if (
+            result &&
+            result.instance &&
+            result.instance.exports
+        ) {
+            const patched =
+                await handleInstance(
+                    args[0],
+                    result.instance,
+                    'normal'
                 );
 
-            return intercept(
+            return {
+                module: result.module,
+                instance: patched
+            };
+        }
+
+        // instantiate(BufferSource) may directly return instance
+        if (
+            result &&
+            result.exports
+        ) {
+            return await handleInstance(
+                args[0],
                 result,
-                "instantiate"
+                'normal-direct'
             );
-        };
+        }
 
-    /*
-     * ---------------------------------------------------------
-     * WebAssembly.instantiateStreaming
-     * ---------------------------------------------------------
-     */
+        return result;
+    };
 
-    const nativeStreaming =
-        WebAssembly.instantiateStreaming;
+    // ============================================================
+    // WebAssembly.instantiateStreaming
+    // ============================================================
 
-    WebAssembly.instantiateStreaming =
-        async function (...args) {
+    const originalStreaming =
+        WebAssembly.instantiateStreaming.bind(WebAssembly);
 
-            log(
-                "WebAssembly.instantiateStreaming()"
-            );
+    WebAssembly.instantiateStreaming = async function (...args) {
+        console.log(TAG, 'WebAssembly.instantiateStreaming()');
 
-            const result =
-                await nativeStreaming.apply(
-                    this,
-                    args
+        const result =
+            await originalStreaming(...args);
+
+        if (
+            result &&
+            result.instance &&
+            result.instance.exports
+        ) {
+            const patched =
+                await handleInstance(
+                    args[0],
+                    result.instance,
+                    'streaming'
                 );
 
-            return intercept(
-                result,
-                "streaming"
-            );
-        };
+            return {
+                module: result.module,
+                instance: patched
+            };
+        }
 
-    log(
-        "PokeSurvivor AutoBot 0.8.0 loaded"
-    );
+        return result;
+    };
+
+    // ============================================================
+    // Diagnostic helpers
+    // ============================================================
+
+    window.PokeSurvivorBot.dump = function () {
+        console.group(TAG, 'STATE');
+
+        console.log('wasm =', state.wasm);
+        console.log('handle =', state.handle);
+
+        console.log(
+            'createCalls =',
+            state.createCalls
+        );
+
+        console.log(
+            'restoreCalls =',
+            state.restoreCalls
+        );
+
+        console.log(
+            'loadCalls =',
+            state.loadCalls
+        );
+
+        console.log(
+            'inputCalls =',
+            state.inputCalls.slice(-20)
+        );
+
+        console.log(
+            'lifecycleCalls =',
+            state.lifecycleCalls.slice(-50)
+        );
+
+        console.groupEnd();
+    };
+
+    window.PokeSurvivorBot.resetLogs = function () {
+        state.createCalls.length = 0;
+        state.restoreCalls.length = 0;
+        state.loadCalls.length = 0;
+        state.lifecycleCalls.length = 0;
+        state.inputCalls.length = 0;
+        state.simCalls.length = 0;
+
+        console.log(TAG, 'logs cleared');
+    };
 
 })();
+```
